@@ -1,0 +1,261 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import pandas as pd
+from scipy.stats import gaussian_kde
+
+# Load data
+file_path = "/Users/ayushfotedar/Documents/eag_ss_combined.csv"
+data = pd.read_csv(file_path)
+
+# Extract relevant columns
+galaxy_ids = data.iloc[:, 0].to_numpy()
+x_positions = data.iloc[:, 5].to_numpy()
+y_positions = data.iloc[:, 6].to_numpy()
+z_positions = data.iloc[:, 7].to_numpy()
+stellar_mass = data["M_star_tot [M_sol]"].to_numpy()
+
+# Apply mass threshold
+mass_threshold = 1e6
+mask = stellar_mass >= mass_threshold
+x_positions_filtered = x_positions[mask]
+y_positions_filtered = y_positions[mask]
+z_positions_filtered = z_positions[mask]
+
+# Function to select a single galaxy
+def select_single_galaxy():
+    idx = np.random.randint(0, len(x_positions_filtered))
+    x, y, z = x_positions_filtered[idx], y_positions_filtered[idx], z_positions_filtered[idx]
+    return np.array([x, y, z])
+
+# Function to generate orthogonal unit vectors
+def orthogonal_unit_vectors(g):
+    x = np.array([1, 0, 0])
+    if np.allclose(g, x):
+        x = np.array([0, 1, 0])
+    u1 = np.cross(g, x)
+    u1 /= np.linalg.norm(u1)
+    u2 = np.cross(g, u1)
+    u2 /= np.linalg.norm(u2)
+    return u1, u2
+
+# --- New: Sample gamma from the truncated Fisher distribution ---
+def sample_gamma_fisher_truncated(sigma_tot=np.radians(5), gamma_max=np.radians(30)):
+    """
+    Sample an offset angle gamma from a Fisher distribution truncated between 0 and gamma_max.
+    
+    Parameters:
+      sigma_tot : total sigma used to compute concentration parameter k
+      gamma_max : maximum gamma in radians (default is 30 degrees in radians)
+      
+    Returns:
+      gamma : sampled angle in radians, guaranteed to be in [0, gamma_max]
+      k     : the concentration parameter used
+    """
+    # Calculate concentration parameter: k = 1/(0.66*sigma_tot^2)
+    k = 1.0 / (0.66 * sigma_tot**2)
+    
+    # For the Fisher distribution, the CDF is:
+    # F(gamma) = (exp(k) - exp(k*cos(gamma))) / (exp(k) - exp(-k))
+    # At gamma = 0, F(0) = 0.
+    # At gamma_max:
+    F_max = (np.exp(k) - np.exp(k * np.cos(gamma_max))) / (np.exp(k) - np.exp(-k))
+    
+    # Generate a uniform random number and scale it to the truncated CDF range:
+    u = np.random.uniform(0, 1)
+    u_trunc = u * F_max  # u_trunc is uniformly distributed between 0 and F_max
+    
+    # Invert the CDF:
+    # u_trunc = (exp(k) - exp(k*cos(gamma))) / (exp(k) - exp(-k))
+    # Solve for exp(k*cos(gamma)):
+    A = np.exp(k) - np.exp(-k)
+    val = np.exp(k) - u_trunc * A
+    # Take logarithm and divide by k:
+    cos_gamma = np.log(val) / k
+    # Clip for numerical precision:
+    cos_gamma = np.clip(cos_gamma, -1, 1)
+    gamma = np.arccos(cos_gamma)
+    return gamma, k
+
+# --- New: Define a function to compute the cumulative probability ---
+def cumulative_probability(gamma1, gamma2, k):
+    """
+    Compute the probability that the offset angle gamma lies between gamma1 and gamma2
+    for a Fisher distribution with concentration parameter k.
+    
+    This is given by:
+      P(gamma1 <= gamma <= gamma2) = (exp(k*cos(gamma1)) - exp(k*cos(gamma2))) / (exp(k) - exp(-k))
+    
+    Parameters:
+      gamma1: lower bound angle in radians
+      gamma2: upper bound angle in radians
+      k: concentration parameter
+      
+    Returns:
+      Probability that gamma lies between gamma1 and gamma2.
+    """
+    return (np.exp(k * np.cos(gamma1)) - np.exp(k * np.cos(gamma2))) / (np.exp(k) - np.exp(-k))
+
+# Example usage of cumulative_probability:
+# Compute probability that gamma is between 5° and 20° for a given k.
+
+
+# --- Modified: generate_b using the Fisher distribution ---
+def generate_b(g, sigma_tot=np.radians(5), sigma_fraction=0.1, gamma_max=np.radians(30)):
+    # Normalize g
+    g_norm = g / np.linalg.norm(g)
+    # Generate orthogonal unit vectors
+    u1, u2 = orthogonal_unit_vectors(g_norm)
+    
+    # Sample gamma from the truncated Fisher distribution
+    gamma, k = sample_gamma_fisher_truncated(sigma_tot=sigma_tot, gamma_max=gamma_max)
+    print(f"Sampled gamma (offset angle): {np.degrees(gamma):.2f} degrees (k={k:.4f})")
+    
+    # Choose a random azimuthal angle in the plane perpendicular to g_norm
+    phi = np.random.uniform(0, 2 * np.pi)
+    r = u1 * np.sin(phi) + u2 * np.cos(phi)
+    
+    # Compute the new offset direction
+    b_direction = g_norm * np.cos(gamma) + r * np.sin(gamma)
+    
+    # Apply distance uncertainty
+    d_true = np.linalg.norm(g)
+    d_uncertain = np.random.normal(loc=d_true, scale=sigma_fraction * d_true)
+    b = b_direction * d_uncertain
+    return b, gamma
+
+# Function to generate multiple b vectors and record gamma values
+def generate_multiple_b_vectors(galaxy_positions, sigma_tot=np.radians(5), sigma_fraction=0.1):
+    perturbed_positions = []
+    gamma_list = []  # to store the sampled gamma values
+    for g in galaxy_positions:
+        b, gamma = generate_b(g, sigma_tot=sigma_tot, sigma_fraction=sigma_fraction)
+        perturbed_positions.append(b)
+        gamma_list.append(gamma)
+    return perturbed_positions, gamma_list
+
+# Function to calculate the angle theta between g and b (unchanged)
+def calculate_theta(g, b):
+    dot_product = np.dot(g, b)
+    magnitude_g = np.linalg.norm(g)
+    magnitude_b = np.linalg.norm(b)
+    cos_theta = dot_product / (magnitude_g * magnitude_b)
+    theta_rad = np.arccos(np.clip(cos_theta, -1, 1))
+    theta_deg = np.degrees(theta_rad)
+    return theta_deg
+
+# Function to select multiple galaxies
+def select_multiple_galaxies(n_galaxies):
+    galaxy_positions = [select_single_galaxy() for _ in range(n_galaxies)]
+    return galaxy_positions
+
+# (Your existing 3D plotting functions remain unchanged.)
+def plot_multiple_g_and_b_vectors(galaxy_positions, perturbed_positions, d_true_list, d_gw_samples_list):
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    cmap = plt.get_cmap('viridis')
+    normalize = plt.Normalize(vmin=min(d_true_list), vmax=max(d_true_list))
+
+    for i, (g, d_true) in enumerate(zip(galaxy_positions, d_true_list)):
+        ax.scatter(g[0], g[1], g[2], color='red', marker='o', s=10, label=f'Host Galaxy {i+1}')
+    for i, (b, d_gw_samples) in enumerate(zip(perturbed_positions, d_gw_samples_list)):
+        d_gw_mean = np.mean(d_gw_samples)
+        ax.scatter(b[0], b[1], b[2], color='blue', marker='o', s=10, label=f'Offset {i+1}')
+    
+    for g, b in zip(galaxy_positions, perturbed_positions):
+      ax.quiver(
+        g[0], g[1], g[2],  # Start point of the arrow (original galaxy position)
+        b[0] - g[0], b[1] - g[1], b[2] - g[2],  # Direction of the arrow (vector from g to b)
+        color='black', arrow_length_ratio=0.3, linewidth=1, alpha = 0.5
+        )
+    
+    ax.set_xlim([0, 100])
+    ax.set_ylim([0, 100])
+    ax.set_zlim([0, 100])
+    ax.set_xlabel('X Position (Mpc)')
+    ax.set_ylabel('Y Position (Mpc)')
+    ax.set_zlabel('Z Position (Mpc)')
+    ax.set_title('3D Plot of Host Galaxies and Offset Positions')
+    
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    # Uncomment the following line to show a legend
+    # ax.legend(by_label.values(), by_label.keys())
+    
+    plt.show()
+
+def plot_offset_kde(galaxy_positions, perturbed_positions):
+    offsets = np.array(perturbed_positions) - np.array(galaxy_positions)
+    x = offsets[:, 0]
+    y = offsets[:, 1]
+    xmin, xmax = -10, 10
+    ymin, ymax = -10, 10
+    xx, yy = np.mgrid[xmin:xmax:100j, ymin:ymax:100j]
+    positions = np.vstack([xx.ravel(), yy.ravel()])
+    kernel = gaussian_kde(np.vstack([x, y]))
+    density = np.reshape(kernel(positions).T, xx.shape)
+    
+    plt.figure(figsize=(10, 8))
+    plt.imshow(np.rot90(density), cmap='viridis', extent=[xmin, xmax, ymin, ymax])
+    plt.colorbar(label='Density')
+    plt.xlabel('Offset in X (Mpc)')
+    plt.ylabel('Offset in Y (Mpc)')
+    plt.title('2D KDE Plot of Offsets in the X-Y Plane')
+    plt.grid(True)
+    plt.show()
+
+# Main script
+n_galaxies = 100
+galaxy_positions = select_multiple_galaxies(n_galaxies)
+# Generate both the perturbed positions and record the gamma values.
+perturbed_positions, gamma_list = generate_multiple_b_vectors(galaxy_positions, sigma_tot=np.radians(5), sigma_fraction=0.1)
+
+# Calculate the angle between g and b (for information)
+theta_list = [calculate_theta(g, b) for g, b in zip(galaxy_positions, perturbed_positions)]
+for i, theta in enumerate(theta_list):
+    print(f"Galaxy {i+1}: Angle between g and b = {theta:.2f} degrees")
+
+# Calculate distances as before
+d_true_list = [np.linalg.norm(g) for g in galaxy_positions]
+d_gw_samples_list = [np.random.normal(loc=d_true, scale=0.3 * d_true, size=1000) for d_true in d_true_list]
+
+plot_multiple_g_and_b_vectors(galaxy_positions, perturbed_positions, d_true_list, d_gw_samples_list)
+# Optionally, you can also plot the KDE of offsets
+# plot_offset_kde(galaxy_positions, perturbed_positions)
+
+# --- New: Plot histogram of the sampled gamma values ---
+# Convert gamma_list from radians to degrees for plotting
+gamma_degrees = np.degrees(gamma_list)
+
+
+
+plt.figure(figsize=(10, 6))
+
+# 1) Plot a normal histogram of gamma (PDF)
+# counts_pdf, bins_pdf, _ = plt.hist(
+#     gamma_degrees,
+#     bins=20,
+#     density=True,
+#     alpha=0.6,            # transparency
+#     label='PDF of $\gamma$'
+# )
+
+#2) Plot the cumulative histogram (CDF) on the same axes
+counts_cdf, bins_cdf, _ = plt.hist(
+    gamma_degrees,
+    bins=20,
+    density=True,
+    cumulative=True,      # cumulative histogram
+    histtype='step',      # draws an unfilled line
+    linewidth=2,
+    label='CDF of $\gamma$'
+)
+
+# 3) Label axes and set title
+plt.xlabel('Offset angle $\gamma$ (degrees)')
+plt.ylabel('Probability')
+plt.title('Histogram (PDF) and Cumulative (CDF) of Offset Angles (Fisher Sampling)')
+
+# 4) Show legend and plot
+plt.legend()
+plt.show()
